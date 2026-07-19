@@ -82,11 +82,17 @@ class TernaryLinear(nn.Module):
     def _ternary(self, w):
         """fp16 → 三元 (-1, 0, +1)。"""
         scale = w.abs().mean() + 1e-8
+        # 防止全零权重导致除零
+        if scale < 1e-6:
+            return torch.zeros_like(w)
         return torch.where(w > 0.5 * scale, 1.0, torch.where(w < -0.5 * scale, -1.0, 0.0))
     
-    def forward(self, x):
+    def forward(self, x, use_ternary=True):
         # 量化到三元
-        w_ternary = self._ternary(self.weight)
+        if use_ternary:
+            w_ternary = self._ternary(self.weight)
+        else:
+            w_ternary = self.weight
         return F.linear(x, w_ternary, self.bias)
     
     @torch.no_grad()
