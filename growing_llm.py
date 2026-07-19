@@ -598,14 +598,16 @@ class GrowthEngine:
         
         self.epochs_since_growth += 1
         
-        # 触发条件: loss停滞 OR (loss>0.05 + 下降极慢)
+        # 触发条件: 停滞 / 缓慢 / 太久没长(10轮+loss<0.03)
         grow = self.model.should_grow(avg_loss)
         slow = False
-        if self.epochs_since_growth >= 8 and avg_loss and avg_loss > 0.05:
+        stale = (self.epochs_since_growth >= 10 and avg_loss and avg_loss < 0.03)
+        if not stale and self.epochs_since_growth >= 6 and avg_loss and avg_loss > 0.01:
             if len(self.model._loss_hist) >= 2:
-                slow = self.model._loss_hist[-1] > self.model._loss_hist[-2] * 0.98
+                ratio = self.model._loss_hist[-1] / max(1e-8, self.model._loss_hist[-2])
+                slow = ratio > 0.97
         
-        if not grow and not slow:
+        if not grow and not slow and not stale:
             return results
         
         if self.model.n_layers < 32:
