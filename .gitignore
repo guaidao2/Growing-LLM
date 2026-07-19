@@ -6,3 +6,5 @@ models/growth/*.pth
 *.npy
 dataset/
 models/growth/*
+chat.py
+train_r1.py
