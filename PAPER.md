@@ -148,6 +148,7 @@ response = model.reply("445端口怎么利用", tokenizer)
 
 ---
 
-**项目地址**: https://github.com/guaidao2/Growing-LLM
+**架构名称**: GameNN-BitMoE
+**项目仓库**: [Growing-LLM](https://github.com/guaidao2/Growing-LLM) (历史沿用名称)
 **作者**: guaidao2 (玄幕安全团队)
 **日期**: 2026年7月
