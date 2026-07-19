@@ -150,39 +150,134 @@ class GLAAttention(nn.Module):
 #  3. 分词器
 # ═══════════════════════════════════════════════════
 
+
 class Tokenizer:
+    """BPE分词器 - <|im_end|>作为单一token,兼容大厂标准。"""
     def __init__(self):
-        self.token_to_id = {'<PAD>': 0, '<UNK>': 1, '<BOS>': 2, '<EOS>': 3}
-        self.id_to_token = {0: '<PAD>', 1: '<UNK>', 2: '<BOS>', 3: '<EOS>'}
-        self.vocab_size = 4
-    def fit(self, texts):
-        for t in texts:
-            for c in t:
-                if c not in self.token_to_id:
-                    i = self.vocab_size
-                    self.token_to_id[c] = i
-                    self.id_to_token[i] = c
-                    self.vocab_size += 1
+        self.merges = {}
+        self.vocab = {}
+        self.inv_vocab = {}
+        self.special = {'<PAD>':0,'<UNK>':1,'<BOS>':2,'<EOS>':3,
+                        '<|im_start|>':4,'<|im_end|>':5}
+        self.vocab_size = 6
+        for k,v in self.special.items():
+            self.vocab[k] = v
+            self.inv_vocab[v] = k
+    
+    @property
+    def token_to_id(self):
+        return self.vocab
+    
+    def _tokenize_to_ids(self, text):
+        """文本 -> 初始token序列 (特殊token作为整体)"""
+        ids = []
+        i = 0
+        while i < len(text):
+            matched = False
+            for st in ['<|im_start|>','<|im_end|>']:
+                if text[i:].startswith(st):
+                    ids.append(self.special[st])
+                    i += len(st)
+                    matched = True
+                    break
+            if matched: continue
+            ch = text[i]
+            ids.append(self.vocab.get(ch, 1))
+            i += 1
+        return ids
+    
+    def fit(self, texts, target_size=8000):
+        """BPE训练: 从字符开始逐步合并高频对。"""
+        # 收集所有字符
+        next_id = self.vocab_size
+        for text in texts:
+            for ch in text:
+                if ch not in self.vocab and ch not in self.special:
+                    self.vocab[ch] = next_id
+                    self.inv_vocab[next_id] = ch
+                    next_id += 1
+        self.vocab_size = next_id
+        
+        # 转为token序列
+        seqs = [self._tokenize_to_ids(t) for t in texts]
+        
+        # BPE合并
+        while self.vocab_size < target_size:
+            pair_counts = {}
+            for seq in seqs:
+                for j in range(1, len(seq)):
+                    p = (seq[j-1], seq[j])
+                    pair_counts[p] = pair_counts.get(p, 0) + 1
+            if not pair_counts: break
+            best = max(pair_counts, key=pair_counts.get)
+            if pair_counts[best] < 2: break
+            
+            new_id = self.vocab_size
+            self.merges[best] = new_id
+            merged_str = self.inv_vocab[best[0]] + self.inv_vocab[best[1]]
+            self.inv_vocab[new_id] = merged_str
+            self.vocab[merged_str] = new_id
+            self.vocab_size += 1
+            
+            for seq in seqs:
+                j = 1
+                while j < len(seq):
+                    if (seq[j-1], seq[j]) == best:
+                        seq[j-1] = new_id
+                        seq.pop(j)
+                    else: j += 1
+    
     def encode(self, text, max_len=256):
-        return [2] + [self.token_to_id.get(c, 1) for c in text[:max_len]]
-    def decode(self, ids, skip_special=True):
-        return ''.join(self.id_to_token.get(i, '?') for i in ids if not (skip_special and i in [0, 1, 2, 3]))
+        ids = self._tokenize_to_ids(text)
+        # BPE合并
+        changed = True
+        while changed and len(ids) > 1:
+            changed = False
+            best_score = -1; best_pos = -1
+            for j in range(1, len(ids)):
+                pair = (ids[j-1], ids[j])
+                if pair in self.merges:
+                    if self.merges[pair] > best_score:
+                        best_score = self.merges[pair]
+                        best_pos = j
+            if best_pos > 0:
+                ids[best_pos-1] = self.merges[(ids[best_pos-1], ids[best_pos])]
+                ids.pop(best_pos)
+                changed = True
+        if len(ids) >= max_len:
+            ids = ids[:max_len-1]
+        return [self.special['<BOS>']] + ids
+    
+    def decode(self, ids):
+        return ''.join(self.inv_vocab.get(i,'?') for i in ids if i>=4)
+    
+    def add_tokens(self, new_tokens):
+        added = 0
+        for t in new_tokens:
+            if t not in self.vocab:
+                self.vocab[t] = self.vocab_size
+                self.inv_vocab[self.vocab_size] = t
+                self.vocab_size += 1
+                added += 1
+        return added
+    
     def save(self, path):
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump({'token_to_id': self.token_to_id}, f, ensure_ascii=False)
+        d = {'vocab': dict(self.vocab), 'inv_vocab': {str(k): v for k,v in self.inv_vocab.items()},
+             'merges': {f'{k[0]},{k[1]}': v for k,v in self.merges.items()},
+             'vocab_size': self.vocab_size, 'special': self.special}
+        json.dump(d, open(path,'w',encoding='utf-8'), ensure_ascii=False)
+    
     @classmethod
     def load(cls, path):
         tok = cls()
-        with open(path, encoding='utf-8') as f:
-            tok.token_to_id = json.load(f)['token_to_id']
-        tok.id_to_token = {v: k for k, v in tok.token_to_id.items()}
-        tok.vocab_size = len(tok.token_to_id)
+        d = json.load(open(path,encoding='utf-8'))
+        tok.vocab = d['vocab']
+        tok.inv_vocab = {int(k) if k.lstrip('-').isdigit() else k: v for k,v in d['inv_vocab'].items()}
+        tok.merges = {tuple(map(int, k.split(','))): v for k,v in d['merges'].items()}
+        tok.vocab_size = d['vocab_size']
+        tok.special = d['special']
         return tok
 
-
-# ═══════════════════════════════════════════════════
-#  4. BitMoE — 大规模稀疏 MoE
-# ═══════════════════════════════════════════════════
 
 class BitMoEFFN(nn.Module):
     """
