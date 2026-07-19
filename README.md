@@ -37,7 +37,7 @@ print(m.reply('445端口怎么利用', tokenizer))
 
 ## 论文
 
-详见 [PAPER_GROWINGLLM.md](PAPER_GROWINGLLM.md)
+详见 [PAPER.md](PAPER.md)
 
 ## 相关项目
 

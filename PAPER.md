@@ -216,10 +216,10 @@ GrowingLLM 是 GameNN 系列中的语言模型组件,与 MoE-GameNN(决策核心
 
 GrowingLLM 验证了"在单个笔记本电脑上运行一个能持续进化的通用智能体"的可行性。通过 BPE 分词器、知识盲区检测、双维度生长、KV Cache、经验回放和网络卸载等机制的组合,一个起始仅 1M 参数的模型可以逐步学习网络安全、数学推理、代码生成等不同领域,并在模型增长超出本地算力时自动分片使用网络资源。
 
-本架构的所有代码均已开源,详见 https://github.com/guaidao2/growing-llm
+本架构的所有代码均已开源,详见 https://github.com/guaidao2/Growing-LLM
 
 ---
 
-**项目地址**: https://github.com/guaidao2/growing-llm
+**项目地址**: https://github.com/guaidao2/Growing-LLM
 **作者**: guaidao2 (玄幕安全团队)
 **日期**: 2026年7月
