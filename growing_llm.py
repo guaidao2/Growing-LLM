@@ -452,6 +452,8 @@ class GrowingLLMv2(nn.Module, GrowthInterface):
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.use_moe = use_moe
+        self.n_moe_experts = n_moe_experts
+        self.max_layers = 48  # 支持增长到~0.5B参数
         
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.pos_embed = nn.Parameter(torch.randn(1, 256, d_model) * 0.02)
@@ -591,6 +593,7 @@ class GrowingLLMv2(nn.Module, GrowthInterface):
         """带KV Cache的自回归生成。"""
         self.eval()
         device = next(self.parameters()).device
+        eos_id = 3
         
         # 预填充
         x = self.token_embed(token_ids) + 0
@@ -612,10 +615,14 @@ class GrowingLLMv2(nn.Module, GrowthInterface):
         
         for step in range(max_new):
             probs = F.softmax(logits[:, -1, :] / temp, dim=-1)
+            # 前5步压制EOS,防止模型立即结束
+            if step < 5:
+                probs[:, eos_id] = 0
+                probs = probs / probs.sum()
             next_id = torch.multinomial(probs, 1)
             token_ids = torch.cat([token_ids, next_id], dim=-1)
             
-            if next_id.item() == 3:
+            if next_id.item() == eos_id:
                 break
             
             # 增量解码 (KV Cache)
