@@ -587,19 +587,29 @@ class GrowthEngine:
     def __init__(self, model):
         self.model = model
         self.cooldown = 0
+        self.epochs_since_growth = 0
     
     def step(self, avg_loss=None):
         results = []
         if self.cooldown > 0:
             self.cooldown -= 1
+            self.epochs_since_growth += 1
             return results
-        if not self.model.should_grow(avg_loss):
+        
+        self.epochs_since_growth += 1
+        
+        # 触发条件: loss停滞 OR 太久没长(每10轮必长)
+        grow = self.model.should_grow(avg_loss)
+        force = self.epochs_since_growth >= 10 and avg_loss and avg_loss > 0.01
+        
+        if not grow and not force:
             return results
         
         if self.model.n_layers < 32:
             added = self.model.grow_depth()
             results.append(('depth', self.model.n_layers, added))
             self.cooldown = 5
+            self.epochs_since_growth = 0
         elif self.model.n_experts < 512:
             added = self.model.grow_expert()
             results.append(('expert', self.model.n_experts, added))
