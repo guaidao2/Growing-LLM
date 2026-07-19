@@ -70,6 +70,7 @@ class TernaryLinear(nn.Module):
         # 主权重 (fp16, 用于训练时更新)
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
+        self.use_ternary = False
         self._reset_parameters()
     
     def _reset_parameters(self):
@@ -87,13 +88,10 @@ class TernaryLinear(nn.Module):
             return torch.zeros_like(w)
         return torch.where(w > 0.5 * scale, 1.0, torch.where(w < -0.5 * scale, -1.0, 0.0))
     
-    def forward(self, x, use_ternary=True):
-        # 量化到三元
-        if use_ternary:
-            w_ternary = self._ternary(self.weight)
-        else:
-            w_ternary = self.weight
-        return F.linear(x, w_ternary, self.bias)
+    def forward(self, x):
+        if self.use_ternary:
+            return F.linear(x, self._ternary(self.weight), self.bias)
+        return F.linear(x, self.weight, self.bias)
     
     @torch.no_grad()
     def compress(self):
