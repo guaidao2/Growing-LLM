@@ -70,7 +70,7 @@ class TernaryLinear(nn.Module):
         # 主权重 (fp16, 用于训练时更新)
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
-        self.use_ternary = False
+        self.use_ternary = False  # 先fp32驯化, epoch 20后再切三元
         self._reset_parameters()
     
     def _reset_parameters(self):
