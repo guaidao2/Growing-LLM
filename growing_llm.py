@@ -350,9 +350,9 @@ class BitMoEBlock(nn.Module):
 #  6. GameNN-BitMoE 主模型
 # ═══════════════════════════════════════════════════
 
-class GameNNBitMoE(nn.Module):
+class GrowingLLM(nn.Module):
     """
-    GameNN-BitMoE: 50B 等效参数语言模型。
+    Growing-LLM: 自生长通用语言模型。
     
     架构:
       TokenEmbed → RoPE → [BitMoEBlock × N] → LM Head

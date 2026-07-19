@@ -1,45 +1,48 @@
-# GameNN-BitMoE: 50B 等效参数通用智能体
+# Growing-LLM: 自生长通用语言模型架构
 
 ## 摘要
 
-GameNN-BitMoE 提出一种在 8GB 消费级 GPU 上训练 50B 等效参数语言模型的可行架构。核心技术组合包括：
+Growing-LLM 提出一种参数动态增长的通用语言模型架构。最初版本采用标准 Transformer 架构,通过知识盲区检测机制自动增加网络深度(从 2 层到 17 层)完成基础语言能力训练。在验证了自生长机制有效性之后,因消费级 GPU 算力限制(8GB),进一步研究出极致内存效率的改进方案——结合 **BitNet b1.58** (1.58-bit 三元权重)、**MoE 512 专家 × Top-1 路由**、**GLA 线性注意力** 三大技术,最终实现在 8GB 笔记本 GPU 上训练 50B 等效参数语言模型。
 
-- **BitNet b1.58** (微软, 2402.17764) — 1.58-bit 三元权重,50B 参数仅需 ~10GB 存储
-- **MoE 512 专家 × Top-1 路由** (Google, 2101.03961) — 每步只激活 ~100M 参数
-- **GLA Gated Linear Attention** (2312.06635) — O(N) 训练复杂度, O(1) 生成复杂度
-- **GameNN 生长机制** (本架构) — 从 2 层 4 专家种子开始,知识盲区触发生长
+Growing-LLM 是 GameNN 系列的语言模型实现,继承其核心设计哲学:**不要一开始就定死参数量,让模型根据学习需求逐步生长。**
 
-这是 GameNN 系列的终极架构,整合了此前所有项目的核心设计:
+## 1. 自生长机制
 
-| 项目 | 贡献 |
-|------|------|
-| Game-nn Simulator | ExpertGRU 动态增长 |
-| MoE-GameNN | 多专家融合 + Router |
-| GrowingLLM | 深度/宽度双维度生长 |
-| MuLun-Mind | 侧枝决策架构 |
-| 本工作 | BitNet × MoE × GLA 统一 |
+### 1.1 知识盲区检测
 
-## 1. 架构设计
-
-### 1.1 整体结构
-
-```
-输入 → TokenEmbed(字符级) → RoPE → [BitMoEBlock × N] → LM Head(三元)
-                                          ↑
-                                    GrowthEngine
-                                (深度/专家增长调度)
-
-BitMoEBlock:
-  RMSNorm → GLA(线性注意力) → Residual + Dropout
-  RMSNorm → BitMoEFFN(三元 × 512专家 Top-1) → Residual + Dropout
+```python
+gap = 1 - max(softmax(logits))
+gap > 0.5 + 持续上升 → 触发生长
 ```
 
-### 1.2 BitNet 三元线性层
+### 1.2 三维生长
 
-标准线性层: y = x · W^T + b (W 为 fp32, 4 字节/参数)
-三元线性层: y = x · ternary(W)^T + b (ternary(W) ∈ {-1, 0, +1}, 1.58 位/参数)
+| 维度 | 起始 | 终点 | 触发条件 |
+|------|------|------|----------|
+| 深度 | 2 层 | N 层 | 盲区高 + 层数少 |
+| 宽度 | 256 维 | 1024 维 | 盲区高 + 层数够 |
+| 专家 | 4 个 | 512 个 | 盲区高 + MoE 模式 |
 
-训练时保存 fp16 主权重,前向时量化:
+### 1.3 实验验证
+
+使用 DeepSeek-R1 蒸馏数据(39K 条中文问答)在 RTX 5060 8GB 上验证:
+
+| 阶段 | 层数 | 参数量 | Loss | 时间 |
+|------|------|--------|------|------|
+| 种子 | 2 | 4.7M | - | - |
+| 基础语言 | 4 | 7.7M | 3.30 | 4min |
+| 语法掌握 | 8 | 13.5M | 1.99 | 20min |
+| 精细调整 | 17 | 26.5M | 1.18 | 15h |
+
+训练过程中模型自动从 2 层生长至 17 层,全程无需人工干预。
+
+## 2. 极致效率方案
+
+因消费级 GPU 算力限制(8GB),进一步设计以下效率优化组合:
+
+### 2.1 BitNet b1.58 三元权重
+
+标准线性层(4 字节/参数) → 三元线性层(1.58 位/参数):
 
 ```python
 def _ternary(w):
@@ -47,85 +50,74 @@ def _ternary(w):
     return where(w > 0.5*scale, 1, where(w < -0.5*scale, -1, 0))
 ```
 
-50B 参数三元存储: 50×10⁹ × 1.58 / 8 ≈ 9.9 GB (vs fp16 的 100GB)
+前向仅需整数加法,50B 参数存储仅 ~10GB。
 
-### 1.3 GLA 线性注意力
+### 2.2 GLA 线性注意力
 
-标准 Attention: O = softmax(QK^T)V  (O(N²))
-GLA: S_t = G_t ⊙ S_{t-1} + K_t · V_t, O_t = Q_t · S_t  (O(N))
-
-| 特性 | FlashAttn | GLA |
-|------|-----------|-----|
+| 特性 | 标准 Attention | GLA |
+|------|---------------|-----|
 | 复杂度 | O(N²) | O(N) |
-| 生成步进 | O(N) KV Cache | O(1) RNN 状态 |
-| 长序列(8K+) | 显存爆炸 | 线性增长 |
-| 矩阵乘法 | 需要 | 加法为主 |
+| 生成 | O(N) KV Cache | O(1) RNN 状态 |
+| 长序列 8K+ | 显存爆炸 | 线性增长 |
 
-### 1.4 MoE 512 专家 × Top-1
+GLA RNN 形式: S_t = G_t ⊙ S_{t-1} + K_t · V_t
+
+### 2.3 MoE 512 专家 × Top-1 路由
+
+Router 每 token 选择最匹配的 1 个专家。总参数 50B,每步仅 ~100M 活跃。非活跃专家存放 CPU,GPU 常驻 ≤4 个。
+
+### 2.4 组合效果
+
+| 路径 | 50B 参数 | GPU 显存 | 训练速度 |
+|------|---------|---------|---------|
+| 标准 Transformer | 200GB | ❌ 无法训练 | - |
+| 纯 MoE | 100GB | ❌ 超限 | - |
+| Growing-LLM (本方案) | ~10GB | < 2GB | ~10 tok/s |
+
+## 3. 架构
 
 ```
-Router: 每 token 选择最匹配的 1 个专家
-激活: 总参数 50B, 每步只激活 ~100M
-卸载: 非活跃专家在 CPU, GPU 常驻 ≤4 个
-生长: 从 4 专家开始, 动态增长到 512
+输入 → TokenEmbed → RoPE → [GrowingBlock × N] → LM Head
+
+GrowingBlock:
+  RMSNorm → GLA(线性注意力) → Residual + Dropout
+  RMSNorm → BitMoEFFN(Ternary × Experts Top-1) → Residual + Dropout
+
+GrowthEngine (统一调度):
+  盲区检测 → 深度/专家/宽度增长决策
 ```
 
-## 2. 生长机制
-
-```
-知识盲区: gap = 1 - max(softmax(logits))
-gap > 0.5 + 持续上升 → 生长触发
-
-生长决策:
-  层数 < 32 → 加层
-  层数够    → 加专家 (4 → 512)
-  宽度可选  → 加维度 (256 → 1024)
-```
-
-| 阶段 | 层数 | 专家 | 参数量 | GPU 显存 |
-|------|------|------|--------|----------|
-| 种子 | 2 | 4 | 3.7M | 0.5GB |
-| 基础 | 4 | 8 | 15M | 0.6GB |
-| 扩展 | 8 | 16 | 100M | 0.8GB |
-| 大规模 | 16 | 64 | 6B | 1.2GB |
-| 极限 | 32 | 512 | 50B | 2GB (卸载) |
-
-## 3. 与 GameNN 家族的关系
-
-GameNN 系列所有变体共享同一个核心思想——动态增长:
+## 4. 与 GameNN 系列的关系
 
 ```
 Game-nn Simulator (坦克棋)
   └─ ExpertGRU 动态增长
-      └─ MoE-GameNN (量化交易/五子棋)
+      └─ MoE-GameNN (量化交易)
           └─ Router + 多专家融合
-              └─ GrowingLLM (自生长语言模型)
-                  └─ 深度/宽度生长
-                      └─ GameNN-BitMoE (本工作)
-                          └─ BitNet × MoE × GLA
-                              └─ 50B 在 8GB GPU 上训练
+              └─ MuLun-Mind/MuLun-Waf (网安应用)
+                  └─ Growing-LLM (本架构)
+                      └─ 自生长语言模型
 ```
 
-统一架构:
+所有变体共享 GrowthEngine:
 
 ```python
 class GrowthEngine:
     def step(self, avg_loss):
-        # 所有 GameNN 变体共享的生长逻辑
         if knowledge_gap > threshold:
-            model.grow_depth() / grow_expert()
+            model.grow_depth() / grow_width() / grow_expert()
 ```
 
-## 4. 核心代码
+## 5. 使用
 
 ```python
-from growing_llm import GameNNBitMoE, Tokenizer, GrowthEngine
+from growing_llm import GrowingLLM, Tokenizer, GrowthEngine
 
-# 创建模型 (种子: 2层, 4专家, 256维)
-model = GameNNBitMoE(vocab_size=8000, d_model=256, init_layers=2, n_experts=4)
+# 种子初始化
+model = GrowingLLM(vocab_size=8000, d_model=256, init_layers=2, n_experts=4)
 engine = GrowthEngine(model)
 
-# 训练循环
+# 训练
 for epoch in range(100):
     loss = train_step(model, data)
     engine.step(avg_loss=loss)  # 自动生长
@@ -134,21 +126,14 @@ for epoch in range(100):
 response = model.reply("445端口怎么利用", tokenizer)
 ```
 
-## 5. 引用
+## 6. 结论
 
-```
-@misc{bitmoe2026,
-  author = {guaidao2},
-  title = {GameNN-BitMoE: 50B Parameter Language Model on 8GB GPU},
-  year = {2026},
-  publisher = {GitHub},
-  url = {https://github.com/guaidao2/Growing-LLM}
-}
-```
+Growing-LLM 验证了一个核心假设:**通用语言模型不需要一开始就拥有全部参数,而应该根据学习需求逐步生长。** 在 8GB 消费级 GPU 上,从 2 层 4.7M 参数种子开始,自动生长至 17 层 26.5M 参数完成基础语言训练;通过 BitNet × MoE × GLA 组合,理论上可在同等硬件上训练 50B 等效参数模型。
 
 ---
 
-**架构名称**: GameNN-BitMoE
-**项目仓库**: [Growing-LLM](https://github.com/guaidao2/Growing-LLM) (历史沿用名称)
+**架构名称**: Growing-LLM
+**项目仓库**: https://github.com/guaidao2/Growing-LLM
 **作者**: guaidao2 (玄幕安全团队)
 **日期**: 2026年7月
+**所属系列**: GameNN
