@@ -391,32 +391,24 @@ class TransformerBlock(nn.Module):
         d_ff = d_ff or d_model * 3
         self.d_model = d_model
         self.use_moe = use_moe
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.self_attn = FlashAttn(d_model, nhead)
         if use_moe:
             self.ffn = MoEFFN(d_model, d_ff // 2, n_moe_experts)
         else:
             self.ffn = SwiGLU(d_model, d_ff)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
         self.dropout = nn.Dropout(0.1)
     
     def forward(self, x, mask=None, kv_cache=None):
-        if kv_cache is not None:
-            # 增量解码
-            cached_k, cached_v = kv_cache
-            q = self.norm1(x)
-            k = v = q
-            if cached_k is not None:
-                k = torch.cat([cached_k, k], dim=1)
-                v = torch.cat([cached_v, v], dim=1)
-            attn_out, _ = self.self_attn(q, k, v, attn_mask=None if mask is None else mask[-1:, :k.shape[1]])
-            x = x + self.dropout(attn_out)
-            return self.norm2(x + self.dropout(self.ffn(x))), (k, v)
-        else:
-            x2 = self.self_attn(x, x, x, attn_mask=mask)[0]
-            x = self.norm1(x + self.dropout(x2))
-            x = self.norm2(x + self.dropout(self.ffn(x)))
-            return x
+        residual = x
+        x = self.norm1(x)
+        attn_out, new_kv = self.self_attn(x, mask=mask, kv_cache=kv_cache)
+        x = residual + self.dropout(attn_out)
+        residual = x
+        x = self.norm2(x)
+        x = residual + self.dropout(self.ffn(x))
+        return (x, new_kv) if kv_cache is not None else x
     
     def clone_weights(self, src, noise=0.02):
         self.load_state_dict(src.state_dict())
@@ -598,7 +590,7 @@ class GrowingLLMv2(nn.Module, GrowthInterface):
         device = next(self.parameters()).device
         
         # 预填充
-        x = self.token_embed(token_ids) + self.pos_embed[:, :token_ids.shape[1], :]
+        x = self.token_embed(token_ids) + 0
         x = self.dropout(x)
         L = token_ids.shape[1]
         causal_mask = torch.triu(torch.full((L, L), float('-inf'), device=device), diagonal=1)
@@ -624,7 +616,7 @@ class GrowingLLMv2(nn.Module, GrowthInterface):
                 break
             
             # 增量解码 (KV Cache)
-            x = self.token_embed(next_id) + self.pos_embed[:, :1, :]
+            x = self.token_embed(next_id) + 0
             x = self.dropout(x)
             new_kv = []
             for i, layer in enumerate(self.layers):
@@ -941,4 +933,65 @@ class NetworkShard:
 
 # 补上 import random
 import random
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+    def forward(self, x):
+        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
+    def expand_width(self, old_dim, new_dim):
+        w = self.weight.data
+        new_w = torch.ones(new_dim)
+        new_w[:old_dim] = w
+        self.weight = nn.Parameter(new_w)
+
+
+def precompute_rope(dim, max_len=256, base=10000.0, device='cpu'):
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
+    pos = torch.arange(max_len, device=device).float()
+    sincos = torch.einsum('i,j->ij', pos, inv_freq)
+    return torch.stack([sincos.sin(), sincos.cos()], dim=-1).unsqueeze(0)
+
+
+def apply_rope(x, rope_cache):
+    B, L, D = x.shape
+    x = x.view(B, L, D // 2, 2)
+    sin, cos = rope_cache[0, :L, :, 0], rope_cache[0, :L, :, 1]
+    x_rot = torch.stack([
+        x[..., 0] * cos - x[..., 1] * sin,
+        x[..., 1] * cos + x[..., 0] * sin,
+    ], dim=-1)
+    return x_rot.view(B, L, D)
+
+
+class FlashAttn(nn.Module):
+    def __init__(self, d_model, nhead):
+        super().__init__()
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.in_proj = nn.Linear(d_model, d_model * 3)
+        self.out_proj = nn.Linear(d_model, d_model)
+    def forward(self, x, mask=None, kv_cache=None):
+        B, L, D = x.shape
+        qkv = self.in_proj(x).view(B, L, 3, self.nhead, self.head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        if kv_cache is not None:
+            ck, cv = kv_cache
+            if ck is not None:
+                k = torch.cat([ck, k], dim=2)
+                v = torch.cat([cv, v], dim=2)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=0.1 if self.training else 0.0,
+        )
+        out = out.transpose(1, 2).contiguous().reshape(B, -1, D)
+        return self.out_proj(out), (k, v)
+    def expand_width(self, old_dim, new_dim):
+        self.in_proj = nn.Linear(new_dim, new_dim * 3).to(self.in_proj.weight.device)
+        self.out_proj = nn.Linear(new_dim, new_dim).to(self.out_proj.weight.device)
+        self.head_dim = new_dim // self.nhead
 
