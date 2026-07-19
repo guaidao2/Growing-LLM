@@ -126,12 +126,12 @@ class GLAAttention(nn.Module):
         self.v_proj = TernaryLinear(d_model, d_model)
         self.g_proj = TernaryLinear(d_model, nhead)
         self.out_proj = TernaryLinear(d_model, d_model)
-    def forward(self, x, mask=None, state=None):
+    def forward(self, x, mask=None, state=None, force_gla=False):
         B, L, D = x.shape; H, Dh = self.nhead, self.head_dim
         q = self.q_proj(x).view(B, L, H, Dh)
         k = self.k_proj(x).view(B, L, H, Dh)
         v = self.v_proj(x).view(B, L, H, Dh)
-        if L < self.gla_threshold and state is None:
+        if L < self.gla_threshold and state is None and not force_gla:
             q = q.transpose(1,2); k = k.transpose(1,2); v = v.transpose(1,2)
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
             out = out.transpose(1,2).contiguous().reshape(B, L, D)
