@@ -17,15 +17,16 @@ CONFIG = {
     'init_layers': 2,
     'use_moe': True,
     'n_moe_experts': 4,
-    'batch_size': 256,
-    'epochs': 100,
+    'batch_size': 128,
+    'epochs': 200,
     'lr': 5e-4,
     'weight_decay': 1e-5,
-    'max_seq_len': 256,
+    'max_seq_len': 128,
     'save_path': 'models/growth/llm_r1.pth',
     'save_every': 5,  # epoch
-    'log_every': 5,
+    'log_every': 1,
     'growth_patience': 8,
+    'fp16': True,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
 }
 
@@ -46,7 +47,11 @@ class TextDataset(Dataset):
     
     def __getitem__(self, idx):
         ids = self.tokenizer.encode(self.data[idx], max_len=self.max_len)
-        return torch.tensor(ids, dtype=torch.long)
+        # 固定长度padding,避免collate_fn动态padding的CPU开销
+        padded = torch.full((self.max_len + 2,), 0, dtype=torch.long)  # +2 for BOS/EOS
+        length = min(len(ids), self.max_len + 2)
+        padded[:length] = torch.tensor(ids[:length], dtype=torch.long)
+        return padded
 
 
 def build_tokenizer(data_path, vocab_size=12000):
@@ -104,8 +109,7 @@ def train():
     # 2. Dataset
     print('\n[2/4] Loading dataset...')
     ds = TextDataset(cfg['data_path'], tokenizer, cfg['max_seq_len'])
-    dl = DataLoader(ds, batch_size=cfg['batch_size'], shuffle=True,
-                    collate_fn=collate_fn, num_workers=0)
+    dl = DataLoader(ds, batch_size=cfg['batch_size'], shuffle=True, pin_memory=True)
     print(f'  Samples: {len(ds):,}')
     print(f'  Batches: {len(dl):,}')
     
@@ -122,13 +126,22 @@ def train():
     
     engine = GrowthEngine(llm=model)
     
-    # 尝试加载已有权重
+    # 尝试加载已有权重 (支持不同层数)
     if os.path.exists(cfg['save_path']):
         try:
-            model.load_state_dict(torch.load(cfg['save_path'], map_location=device))
-            print(f'  Resumed from: {cfg["save_path"]}')
-        except:
-            print(f'  Starting fresh (weight load failed)')
+            sd = torch.load(cfg['save_path'], map_location=device)
+            # 从权重的key数量推算实际层数
+            layer_keys = [k for k in sd if k.startswith('layers.')]
+            loaded_layers = max(int(k.split('.')[1]) for k in layer_keys) + 1 if layer_keys else cfg['init_layers']
+            if loaded_layers > cfg['init_layers']:
+                print(f'  Detected {loaded_layers} layers in checkpoint, adjusting model...')
+                # 生长到对应层数
+                while model.n_layers < loaded_layers:
+                    model.grow_depth()
+            model.load_state_dict(sd)
+            print(f'  Resumed from: {cfg["save_path"]} ({loaded_layers} layers)')
+        except Exception as e:
+            print(f'  Fresh start (resume failed: {e})')
     
     print(f'  Params: {model.count_params():,}')
     print(f'  Layers: {model.n_layers}')
@@ -141,6 +154,7 @@ def train():
     print()
     
     opt = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
+    scaler = torch.cuda.amp.GradScaler(enabled=cfg['fp16'])
     last_grow = -20
     best_loss = float('inf')
     t0 = time.time()
@@ -150,24 +164,35 @@ def train():
         model.train()
         total_loss = 0
         n_batches = 0
+        t_epoch = time.time()
         
-        for batch in dl:
+        for batch_idx, batch in enumerate(dl):
             batch = batch.to(device)
             if batch.size(1) < 4: continue
             
-            logits = model(batch[:, :-1])
-            loss = F.cross_entropy(
+            with torch.cuda.amp.autocast(enabled=cfg['fp16']):
+                logits = model(batch[:, :-1])
+                loss = F.cross_entropy(
                 logits.reshape(-1, tokenizer.vocab_size),
                 batch[:, 1:].reshape(-1)
             )
             
             opt.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             
             total_loss += loss.item()
             n_batches += 1
+            
+            # 实时进度 (每10个batch)
+            if batch_idx % 10 == 0:
+                elapsed = time.time() - t_epoch
+                pct = batch_idx / len(dl) * 100
+                avg = total_loss / max(1, n_batches)
+                print(f'  Ep {epoch:3d} [{pct:3.0f}%] loss={avg:.4f} | {batch_idx}/{len(dl)} | {elapsed:.0f}s', end='\r')
         
         avg_loss = total_loss / max(1, n_batches)
         
@@ -179,6 +204,7 @@ def train():
         if loss_stuck or high_loss:
             model.grow_depth()
             opt = torch.optim.AdamW(model.parameters(), lr=cfg['lr'] * 0.9, weight_decay=cfg['weight_decay'])
+            scaler = torch.cuda.amp.GradScaler(enabled=cfg['fp16'])
             last_grow = epoch
             growth_events.append(epoch)
         
