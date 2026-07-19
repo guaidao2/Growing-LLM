@@ -453,10 +453,12 @@ class GrowingLLMv2(nn.Module, GrowthInterface):
         self.vocab_size = vocab_size
         self.use_moe = use_moe
         self.n_moe_experts = n_moe_experts
-        self.max_layers = 48  # 支持增长到~0.5B参数
+        self.max_layers = 256  # 理论上限256层,实际由GPU显存和loss收敛决定
+        self.widths = [192, 256, 384, 512]
+        self.max_width_idx = len(self.widths) - 1  # 512维上限
         
         self.token_embed = nn.Embedding(vocab_size, d_model)
-        self.pos_embed = nn.Parameter(torch.randn(1, 256, d_model) * 0.02)
+        self.register_buffer('rope_cache', precompute_rope(d_model, 512))
         self.dropout = nn.Dropout(0.1)
         
         self.layers = nn.ModuleList()
@@ -581,7 +583,8 @@ class GrowingLLMv2(nn.Module, GrowthInterface):
     
     def forward(self, token_ids, mask=None):
         B, L = token_ids.shape
-        x = self.token_embed(token_ids) + self.pos_embed[:, :L, :]
+        x = self.token_embed(token_ids)
+        x = apply_rope(x, self.rope_cache)
         x = self.dropout(x)
         causal_mask = torch.triu(torch.full((L, L), float('-inf'), device=token_ids.device), diagonal=1)
         for layer in self.layers:

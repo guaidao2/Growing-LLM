@@ -3,3 +3,4 @@ train_from_minimind.py
 dataset/
 models/growth/*.pth
 *.jsonl
+*.npy
