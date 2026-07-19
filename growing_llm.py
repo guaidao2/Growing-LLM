@@ -12,8 +12,181 @@ from collections import deque
 
 # ═══════════════════════════════════════════════════
 #  统一生长接口
+# ══════════════════════════════
+# ═══════════════════════════════════════════════════
+#  交叉领域迁移学习
 # ═══════════════════════════════════════════════════
 
+class CrossDomainTransfer:
+    """
+    跨领域范式迁移。
+    
+    核心思想:
+      一个领域学到的抽象范式可以迁移到另一个领域。
+      例如: 网安中"扫描端口"的策略 = 数学中"穷举所有可能解"的策略
+            提权中的"逐步提升权限" = 编程中的"逐步增加功能复杂度"
+    
+    工作机制:
+      1. 学完领域A后,提取"范式指纹"(注意力模式 + 专家路由偏好)
+      2. 学领域B前,计算B与已有领域的相似度
+      3. 找到最相似的领域,迁移其范式作为初始化
+      4. 只有真正新的模式才触发增长
+    
+    效果:
+      - 减少新领域所需的生长次数
+      - 加速新领域的学习速度
+      - 实现"触类旁通"的智能行为
+    """
+    
+    def __init__(self, llm):
+        self.llm = llm
+        self.pattern_bank = {}  # domain_name -> pattern_dict
+        self.transfer_log = []
+    
+    def extract_patterns(self, domain_name, sample_texts=None, tokenizer=None):
+        """
+        从当前模型提取"范式指纹"。
+        
+        包含:
+          1. 注意力头重要性 (每层每个头对预测的贡献)
+          2. 专家路由偏好  (MoE模式下各专家的使用频率)
+          3. 激活模式      (各层神经元的平均激活值)
+          4. 知识盲区分布   (模型在哪些输入上不确定)
+        """
+        device = next(self.llm.parameters()).device
+        patterns = {
+            'domain': domain_name,
+            'n_layers': self.llm.n_layers,
+            'd_model': self.llm.d_model,
+            'attention_patterns': [],
+            'neuron_importance': [],
+            'confidence_profile': [],
+        }
+        
+        # 1. 注意力头重要性: 每层每个头的平均注意力权重
+        self.llm.eval()
+        with torch.no_grad():
+            for layer_idx, layer in enumerate(self.llm.layers):
+                # 用 dummy 输入获取注意力权重
+                dummy = torch.randn(1, 16, self.llm.d_model, device=device)
+                try:
+                    out = layer.self_attn(dummy, dummy, dummy)
+                    if isinstance(out, tuple):
+                        attn_weights = out[1]  # (B, H, L, L)
+                        if attn_weights is not None:
+                            head_importance = attn_weights.mean(dim=[0, 2, 3]).cpu().numpy()
+                            patterns['attention_patterns'].append(head_importance.tolist())
+                except:
+                    patterns['attention_patterns'].append([1.0 / layer.self_attn.num_heads] * layer.self_attn.num_heads)
+        
+        # 2. 神经元重要性: 各层权重的L2范数
+        for layer_idx, layer in enumerate(self.llm.layers):
+            importance = []
+            for name, param in layer.named_parameters():
+                importance.append(param.norm().item())
+            patterns['neuron_importance'].append(importance)
+        
+        # 3. 置信度分布: 在样本上的表现
+        if sample_texts and tokenizer:
+            confidences = []
+            for text in sample_texts[:10]:
+                ids = tokenizer.encode(text)
+                t = torch.tensor([ids], device=device)
+                if t.size(1) < 3: continue
+                gap = self.llm.knowledge_gap(t)
+                confidences.append(1.0 - gap)
+            patterns['confidence_profile'] = confidences
+        
+        self.pattern_bank[domain_name] = patterns
+        return patterns
+    
+    def compute_similarity(self, new_domain_samples, tokenizer=None):
+        """
+        计算新领域与已有领域的相似度。
+        
+        使用两种度量:
+          1. 置信度分布相似度 (模型在新旧领域上的表现一致性)
+          2. 如果新领域在旧领域专家上表现好 → 相似度高
+        """
+        if not self.pattern_bank:
+            return {}
+        
+        device = next(self.llm.parameters()).device
+        similarities = {}
+        
+        for old_domain, old_patterns in self.pattern_bank.items():
+            # 用置信度分布比较
+            if tokenizer and len(new_domain_samples) > 0:
+                new_conf = []
+                for text in new_domain_samples[:10]:
+                    ids = tokenizer.encode(text)
+                    t = torch.tensor([ids], device=device)
+                    if t.size(1) < 3: continue
+                    new_conf.append(1.0 - self.llm.knowledge_gap(t))
+                
+                old_conf = old_patterns.get('confidence_profile', [])
+                if old_conf and new_conf:
+                    # 皮尔逊相关系数
+                    min_len = min(len(old_conf), len(new_conf))
+                    if min_len > 2:
+                        import numpy as np
+                        corr = np.corrcoef(old_conf[:min_len], new_conf[:min_len])[0, 1]
+                        similarities[old_domain] = max(0, corr)
+        
+        return dict(sorted(similarities.items(), key=lambda x: -x[1]))
+    
+    def transfer(self, target_domain, sample_texts=None, tokenizer=None):
+        """
+        对目标领域应用范式迁移。
+        
+        返回:
+          - source_domain: 迁移来源
+          - similarity: 相似度
+          - transferred_patterns: 迁移的具体模式
+        """
+        similarities = self.compute_similarity(sample_texts or [], tokenizer)
+        
+        if not similarities:
+            self.transfer_log.append({
+                'target': target_domain,
+                'source': None,
+                'similarity': 0,
+                'action': 'no_transfer(no prior domains)',
+            })
+            return None, 0, []
+        
+        best_domain = max(similarities, key=similarities.get)
+        best_sim = similarities[best_domain]
+        
+        transferred = []
+        
+        if best_sim > 0.3:
+            # 高相似度: 迁移注意力模式 + 权重
+            source_patterns = self.pattern_bank[best_domain]
+            
+            # 迁移注意力头重要性: 冻结不重要头,重点训练重要头
+            if source_patterns['attention_patterns']:
+                for layer_idx, head_imp in enumerate(source_patterns['attention_patterns']):
+                    if layer_idx < len(self.llm.layers):
+                        # 记录哪些头重要 (用于后续训练时分配更多学习率)
+                        transferred.append({
+                            'type': 'attention_prior',
+                            'layer': layer_idx,
+                            'head_importance': head_imp,
+                        })
+            
+            # 如果新旧领域层数一致,直接迁移底层权重
+            if source_patterns['n_layers'] <= self.llm.n_layers:
+                transferred.append({
+                    'type': 'weight_init',
+                    'source_domain': best_domain,
+                    'layers_transferred': source_patterns['n_layers'],
+                })
+            
+            action = f'transfer_from_{best_domain}(sim={best_sim:.2f})'
+        else:
+            action = f'no_transfer(no_similar_domain, best={best_sim:.2f})'
+from cross_domain import CrossDomainTransfer
 class GrowthInterface:
     """所有可生长模型必须实现的接口。"""
     
@@ -722,3 +895,4 @@ class NetworkShard:
 
 # 补上 import random
 import random
+
