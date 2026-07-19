@@ -327,15 +327,12 @@ class SwiGLU(nn.Module):
         self.w3 = nn.Linear(h, dim)
     def forward(self, x):
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
-    
     def expand_width(self, old_dim, new_dim):
-        """扩展宽度: old_dim → new_dim。"""
         for name, p in [('w1', self.w1), ('w2', self.w2), ('w3', self.w3)]:
             w, b = p.weight.data, p.bias.data
             new_w = torch.zeros(new_dim if 'w3' not in name else w.shape[0], 
                               new_dim if 'w3' in name else w.shape[1])
             new_b = torch.zeros(new_dim if 'w3' not in name else b.shape[0])
-            # 复制旧权重
             min_d0 = min(w.shape[0], new_w.shape[0])
             min_d1 = min(w.shape[1], new_w.shape[1])
             new_w[:min_d0, :min_d1] = w[:min_d0, :min_d1]
@@ -344,13 +341,61 @@ class SwiGLU(nn.Module):
             p.bias = nn.Parameter(new_b)
 
 
+class MoEFFN(nn.Module):
+    """Mixture of Experts FFN."""
+    def __init__(self, dim=192, expert_dim=None, n_experts=4, top_k=2):
+        super().__init__()
+        self.dim = dim
+        self.n_experts = n_experts
+        self.top_k = top_k
+        ed = expert_dim or dim * 2
+        self.experts = nn.ModuleList([SwiGLU(dim, ed) for _ in range(n_experts)])
+        self.router = nn.Linear(dim, n_experts)
+        self.noise = nn.Linear(dim, n_experts)
+    def forward(self, x):
+        B, L, D = x.shape
+        logits = self.router(x)
+        noise = torch.randn_like(logits) * F.softplus(self.noise(x))
+        weights, indices = torch.topk(logits + noise, self.top_k, dim=-1)
+        weights = F.softmax(weights, dim=-1)
+        out = torch.zeros_like(x)
+        for i, exp in enumerate(self.experts):
+            mask = (indices == i).any(dim=-1)
+            if mask.any():
+                eo = exp(x[mask].unsqueeze(0)).squeeze(0)
+                w = (weights * (indices == i).float()).sum(dim=-1)
+                out[mask] += eo * w[mask].unsqueeze(-1)
+        return out
+    def add_expert(self):
+        ne = SwiGLU(self.dim, self.dim * 2).to(next(self.parameters()).device)
+        ne.load_state_dict(self.experts[-1].state_dict())
+        for p in ne.parameters(): p.data += torch.randn_like(p) * 0.02
+        self.experts.append(ne)
+        self.n_experts += 1
+        old_w, old_b = self.router.weight.data, self.router.bias.data
+        self.router = nn.Linear(self.dim, self.n_experts).to(old_w.device)
+        self.router.weight.data[:old_w.shape[0], :old_w.shape[1]] = old_w
+        self.router.bias.data[:old_b.shape[0]] = old_b
+        self.noise = nn.Linear(self.dim, self.n_experts).to(old_w.device)
+        return sum(p.numel() for p in ne.parameters()) + self.dim * 2
+    def expand_width(self, old_dim, new_dim):
+        for e in self.experts: e.expand_width(old_dim, new_dim)
+        self.router = nn.Linear(new_dim, self.n_experts).to(next(self.parameters()).device)
+        self.noise = nn.Linear(new_dim, self.n_experts).to(next(self.parameters()).device)
+    @property
+    def count_experts(self): return self.n_experts
+
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model=192, nhead=4, d_ff=None):
+    def __init__(self, d_model=192, nhead=4, d_ff=None, use_moe=False, n_moe_experts=4):
         super().__init__()
         d_ff = d_ff or d_model * 3
         self.d_model = d_model
+        self.use_moe = use_moe
         self.self_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
-        self.ffn = SwiGLU(d_model, d_ff)
+        if use_moe:
+            self.ffn = MoEFFN(d_model, d_ff // 2, n_moe_experts)
+        else:
+            self.ffn = SwiGLU(d_model, d_ff)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(0.1)
@@ -410,10 +455,11 @@ class GrowingLLMv2(nn.Module, GrowthInterface):
       - KV Cache增量解码
       - WorldModel知识盲区检测
     """
-    def __init__(self, vocab_size=8000, d_model=192, nhead=4, init_layers=2):
+    def __init__(self, vocab_size=8000, d_model=192, nhead=4, init_layers=2, use_moe=False, n_moe_experts=4):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
+        self.use_moe = use_moe
         
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.pos_embed = nn.Parameter(torch.randn(1, 256, d_model) * 0.02)
@@ -421,7 +467,7 @@ class GrowingLLMv2(nn.Module, GrowthInterface):
         
         self.layers = nn.ModuleList()
         for _ in range(init_layers):
-            self.layers.append(TransformerBlock(d_model, nhead))
+            self.layers.append(TransformerBlock(d_model, nhead, use_moe=use_moe, n_moe_experts=n_moe_experts))
         
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.token_embed.weight
