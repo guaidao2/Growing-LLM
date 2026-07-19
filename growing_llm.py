@@ -478,9 +478,12 @@ class GrowingLLMv2(nn.Module, GrowthInterface):
     
     def grow_depth(self):
         """加一层 (深度增长, +~980K参数)。"""
-        new_layer = TransformerBlock(self.d_model).to(next(self.parameters()).device)
+        use_moe = getattr(self, 'use_moe', False)
+        n_moe = getattr(self, 'n_moe_experts', 4) if hasattr(self, 'n_moe_experts') else 4
+        new_layer = TransformerBlock(self.d_model, use_moe=use_moe, n_moe_experts=n_moe).to(next(self.parameters()).device)
         if self.layers:
-            new_layer.clone_weights(self.layers[-1])
+            # Clone weights from last layer (same architecture)
+            new_layer.load_state_dict(self.layers[-1].state_dict())
         self.layers.append(new_layer)
         added = sum(p.numel() for p in new_layer.parameters())
         self.growth_log.append({'type': 'depth', 'to': self.n_layers, 'added': added})
