@@ -115,77 +115,39 @@ class TernaryLinear(nn.Module):
 # ═══════════════════════════════════════════════════
 
 class GLAAttention(nn.Module):
-    """
-    Gated Linear Attention — 线性复杂度, RNN 形式。
-    
-    训练 (O(N)):
-      S = 0
-      for t in 1..N:
-        S = G_t ⊙ S + K_t · V_t    (门控累积)
-        O_t = Q_t · S               (线性输出)
-    
-    生成 (O(1) per step):
-      S_t = G_t ⊙ S_{t-1} + K_t · V_t
-      O_t = Q_t · S_t
-    
-    相比 FlashAttn:
-      - 不计算 O(N²) 注意力矩阵 → 省显存, 省计算
-      - RNN 形式 → O(1) 生成, 无需 KV Cache
-      - 长序列时吞吐量高 3-5×
-    """
-    
+    """FlashAttn(短序列) / GLA(长序列) 自适应切换。"""
     def __init__(self, d_model, nhead):
         super().__init__()
         assert d_model % nhead == 0
         self.d_model = d_model
         self.nhead = nhead
         self.head_dim = d_model // nhead
-        
-        # QKV + 门控投影
+        self.gla_threshold = 512
         self.q_proj = TernaryLinear(d_model, d_model)
         self.k_proj = TernaryLinear(d_model, d_model)
         self.v_proj = TernaryLinear(d_model, d_model)
-        self.g_proj = TernaryLinear(d_model, nhead)  # 门控
+        self.g_proj = TernaryLinear(d_model, nhead)
         self.out_proj = TernaryLinear(d_model, d_model)
-    
     def forward(self, x, mask=None, state=None):
-        """
-        x: (B, L, D)
-        state: (B, H, D_h, D_h) — 前一步的状态
-        return: (B, L, D), new_state
-        """
-        B, L, D = x.shape
-        H = self.nhead
-        Dh = self.head_dim
-        
+        B, L, D = x.shape; H, Dh = self.nhead, self.head_dim
         q = self.q_proj(x).view(B, L, H, Dh)
         k = self.k_proj(x).view(B, L, H, Dh)
         v = self.v_proj(x).view(B, L, H, Dh)
-        g = torch.sigmoid(self.g_proj(x))  # (B, L, H)
-        
-        # GLA RNN 前向
-        if state is None:
+        if L < self.gla_threshold and state is None:
+            q = q.transpose(1,2); k = k.transpose(1,2); v = v.transpose(1,2)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+            out = out.transpose(1,2).contiguous().reshape(B, L, D)
+            return self.out_proj(out), None
+        g = torch.sigmoid(self.g_proj(x))
+        if state is None or state.ndim < 4:
             state = torch.zeros(B, H, Dh, Dh, device=x.device)
-        elif state.ndim < 4:
-            state = torch.zeros(B, H, Dh, Dh, device=x.device)
-        
         outputs = []
         for t in range(L):
-            # S_t = G_t ⊙ S_{t-1} + K_t ⊗ V_t
-            gt = g[:, t, :].view(B, H, 1, 1)  # (B, H, 1, 1)
-            kt = k[:, t, :, :].unsqueeze(-1)   # (B, H, Dh, 1)
-            vt = v[:, t, :, :].unsqueeze(-2)   # (B, H, 1, Dh)
-            state = gt * state + kt @ vt       # (B, H, Dh, Dh)
-            
-            # O_t = Q_t · S_t
-            qt = q[:, t, :, :]                 # (B, H, Dh)
-            ot = (qt.unsqueeze(-2) @ state).squeeze(-2)  # (B, H, Dh)
+            gt = g[:,t,:].view(B,H,1,1); kt = k[:,t,:,:].unsqueeze(-1); vt = v[:,t,:,:].unsqueeze(-2)
+            state = gt * state + kt @ vt
+            ot = (q[:,t,:,:].unsqueeze(-2) @ state).squeeze(-2)
             outputs.append(ot)
-        
-        out = torch.stack(outputs, dim=1).view(B, L, D)
-        return self.out_proj(out), state
-
-
+        return self.out_proj(torch.stack(outputs,1).view(B,L,D)), state
 # ═══════════════════════════════════════════════════
 #  3. 分词器
 # ═══════════════════════════════════════════════════
