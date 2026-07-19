@@ -352,8 +352,8 @@ class GrowingLLM(nn.Module):
             self.layers.append(BitMoEBlock(d_model, nhead, n_experts))
         
         self.lm_head = TernaryLinear(d_model, vocab_size, bias=False)
-        # 权重绑定: lm_head 与 token_embed 共享权重
-        self.lm_head.weight.data = self.token_embed.weight.data
+        # 权重共享: lm_head 使用同一个 Parameter 对象, 避免梯度双倍
+        self.lm_head.weight = self.token_embed.weight
         
         # 生长追踪
         self.growth_log = []
@@ -440,13 +440,14 @@ class GrowingLLM(nn.Module):
         return gap
     
     def should_grow(self, avg_loss=None):
-        if len(self._loss_hist) < 5:
-            if avg_loss is not None:
-                self._loss_hist.append(avg_loss)
+        if avg_loss is not None:
+            self._loss_hist.append(avg_loss)
+        if len(self._loss_hist) > 30:
+            self._loss_hist.pop(0)
+        if len(self._loss_hist) < 8:
             return False
         recent = np.mean(self._loss_hist[-5:])
-        older = np.mean(self._loss_hist[:-5]) if len(self._loss_hist) >= 10 else recent
-        self._loss_hist.append(avg_loss if avg_loss is not None else recent)
+        older = np.mean(self._loss_hist[:5])  # 取最早5个, 不是倒数前5
         return recent > older * 0.95 and recent > 0.3  # 停滞 + loss 还高
     
     def grow_depth(self):
