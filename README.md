@@ -1,6 +1,6 @@
-# GameNN-BitMoE
+# Growing-LLM
 
-50B 等效参数通用智能体框架 — 在 8GB 笔记本 GPU 上运行。
+GameNN-BitMoE — 50B 等效参数通用智能体框架，在 8GB 笔记本 GPU 上运行。
 
 ## 核心技术组合
 
