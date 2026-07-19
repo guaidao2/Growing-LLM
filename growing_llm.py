@@ -469,6 +469,19 @@ class GrowingLLM(nn.Module):
         self.n_experts = max(layer.ffn.n_experts for layer in self.layers if isinstance(layer.ffn, BitMoEFFN))
         self.growth_log.append({'type': 'expert', 'to': self.n_experts, 'added': added})
         return added
+    
+    def grow_vocab(self, new_tokens):
+        """词表增长: 为 embed + lm_head 增加新 token 行。"""
+        added = len(new_tokens)
+        old = self.token_embed.weight.shape[0]
+        new_embed = nn.Embedding(old + added, self.d_model).to(self.token_embed.weight.device)
+        new_embed.weight.data[:old] = self.token_embed.weight.data
+        new_embed.weight.data[old:] = torch.randn(added, self.d_model) * 0.02
+        self.token_embed = new_embed
+        self.lm_head.weight = self.token_embed.weight  # 保持共享
+        self.vocab_size = old + added
+        self.growth_log.append({'type': 'vocab', 'from': old, 'to': old + added, 'added': added * self.d_model})
+        return added * self.d_model
 
 
 # ═══════════════════════════════════════════════════
