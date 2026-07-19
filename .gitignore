@@ -4,3 +4,5 @@ dataset/
 models/growth/*.pth
 *.jsonl
 *.npy
+dataset/
+models/growth/*
