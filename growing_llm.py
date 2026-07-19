@@ -354,6 +354,8 @@ class GrowingLLM(nn.Module):
             self.layers.append(BitMoEBlock(d_model, nhead, n_experts))
         
         self.lm_head = TernaryLinear(d_model, vocab_size, bias=False)
+        # 权重绑定: lm_head 与 token_embed 共享权重
+        self.lm_head.weight.data = self.token_embed.weight.data
         
         # 生长追踪
         self.growth_log = []
