@@ -500,7 +500,8 @@ class GrowingLLM(nn.Module):
     
     def grow_depth(self):
         ref = self.layers[-1] if self.layers else None
-        nl = BitMoEBlock(self.d_model, nhead=4, n_experts=self.n_experts).to(
+        nhead = ref.attn.nhead if ref else 4
+        nl = BitMoEBlock(self.d_model, nhead=nhead, n_experts=self.n_experts).to(
             next(self.parameters()).device)
         if ref:
             nl.load_state_dict(ref.state_dict())
