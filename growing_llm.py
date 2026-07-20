@@ -187,8 +187,7 @@ class Tokenizer:
         return ids
     
     def fit(self, texts, target_size=8000):
-        """BPE训练: 从字符开始逐步合并高频对。"""
-        # 收集所有字符
+        """字符级 + 特殊token完整。BPE合并对中文不划算, 跳过。"""
         next_id = self.vocab_size
         for text in texts:
             for ch in text:
@@ -197,35 +196,6 @@ class Tokenizer:
                     self.inv_vocab[next_id] = ch
                     next_id += 1
         self.vocab_size = next_id
-        
-        # 转为token序列
-        seqs = [self._tokenize_to_ids(t) for t in texts]
-        
-        # BPE合并
-        while self.vocab_size < target_size:
-            pair_counts = {}
-            for seq in seqs:
-                for j in range(1, len(seq)):
-                    p = (seq[j-1], seq[j])
-                    pair_counts[p] = pair_counts.get(p, 0) + 1
-            if not pair_counts: break
-            best = max(pair_counts, key=pair_counts.get)
-            if pair_counts[best] < 2: break
-            
-            new_id = self.vocab_size
-            self.merges[best] = new_id
-            merged_str = self.inv_vocab[best[0]] + self.inv_vocab[best[1]]
-            self.inv_vocab[new_id] = merged_str
-            self.vocab[merged_str] = new_id
-            self.vocab_size += 1
-            
-            for seq in seqs:
-                j = 1
-                while j < len(seq):
-                    if (seq[j-1], seq[j]) == best:
-                        seq[j-1] = new_id
-                        seq.pop(j)
-                    else: j += 1
     
     def encode(self, text, max_len=256):
         ids = self._tokenize_to_ids(text)
