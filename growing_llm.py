@@ -133,7 +133,7 @@ class GLAAttention(nn.Module):
         v = self.v_proj(x).view(B, L, H, Dh)
         if L < self.gla_threshold and state is None and not force_gla:
             q = q.transpose(1,2); k = k.transpose(1,2); v = v.transpose(1,2)
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=True)
             out = out.transpose(1,2).contiguous().reshape(B, L, D)
             return self.out_proj(out), None
         g = torch.sigmoid(self.g_proj(x))
