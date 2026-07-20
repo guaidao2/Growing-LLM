@@ -455,44 +455,27 @@ class GrowingLLM(nn.Module):
     
     @torch.no_grad()
     def generate(self, token_ids, max_new=128, temp=0.6):
-        """自回归生成 (GLA RNN 状态 O(1) 步进)。"""
+        """自回归生成 (全序列forward, 与训练完全一致)。"""
         self.eval()
-        # Prefill
-        x = self.token_embed(token_ids)
-        x = apply_rope(x, self.rope_cache)
-        x = self.dropout(x)
-        state = None
-        for layer in self.layers:
-            x, state = layer(x, state=state)
-        logits = self.lm_head(x[:, -1:, :])
-        
-        for step in range(max_new):
-            probs = F.softmax(logits[:, -1, :] / temp, dim=-1)
-            if step < 8:
-                for sid in [0, 3]:
-                    probs[:, sid] = 0
-                if probs.sum() > 0:
-                    probs = probs / probs.sum()
-                else:
-                    probs = F.softmax(logits[:, -1, :] / temp, dim=-1)
-            nid = torch.multinomial(probs, 1)
-            token_ids = torch.cat([token_ids, nid], dim=-1)
-            if nid.item() == 3 and step > 4:
+        gen = token_ids[0].tolist() if isinstance(token_ids, torch.Tensor) else token_ids
+        device = next(self.parameters()).device
+        for _ in range(max_new):
+            t = torch.tensor([gen], device=device)
+            logits = self(t)
+            probs = F.softmax(logits[0, -1, :] / temp, dim=-1)
+            if len(gen) < 10:
+                for sid in [0, 1, 2, 3]:
+                    probs[sid] = 0
+                probs = probs / probs.sum()
+            nid = torch.multinomial(probs, 1).item()
+            gen.append(nid)
+            if nid == 3 and len(gen) > 10:
                 break
-            
-            x = self.token_embed(nid)
-            x = apply_rope(x, self.rope_cache[:, :1])
-            x = self.dropout(x)
-            for layer in self.layers:
-                x, state = layer(x, state=state)
-            logits = self.lm_head(x)
-        
-        return token_ids[0].tolist()
+        return gen
     
-    def reply(self, text, tokenizer, max_new=96, temp=0.6):
+    def reply(self, text, tokenizer, max_new=64, temp=0.6):
         ids = tokenizer.encode(text)
-        t = torch.tensor([ids], device=next(self.parameters()).device)
-        out = self.generate(t, max_new, temp)
+        out = self.generate([ids], max_new, temp)
         return tokenizer.decode(out[len(ids):])
     
     # ─── 生长 ───
